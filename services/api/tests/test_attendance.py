@@ -204,9 +204,11 @@ async def _build_setup(client) -> _Setup:
 
     # Pick a date 1 day in the future. The slot's day_of_week will match
     # whatever weekday that is so the materialiser produces a session.
+    # force=true because tests share the seeded teacher as offering owner —
+    # re-runs against a non-fresh DB collide on (teacher, day, time).
     target = date.today() + timedelta(days=1)
     slot = await client.post(
-        "/timetable",
+        "/timetable?force=true",
         headers=admin_h,
         json={
             "course_offering_id": offering_id,
@@ -273,8 +275,11 @@ async def test_materialiser_is_idempotent(client):
     sid1 = await _fetch_session_id(client, setup)
 
     # Patch the slot (no-op end_time tweak) → triggers re-materialise.
+    # force=true: tests share the seeded teacher; re-running the conflict
+    # check from a non-fresh DB still hits its own slot. The patch is a
+    # no-op so this is purely a re-materialisation trigger.
     r = await client.patch(
-        f"/timetable/{setup.slot_id}",
+        f"/timetable/{setup.slot_id}?force=true",
         headers=setup.admin_headers,
         json={"end_time": "11:00:00"},
     )
@@ -289,12 +294,15 @@ async def test_materialiser_skips_holidays(client):
     setup = await _build_setup(client)
     sid_before = await _fetch_session_id(client, setup)
 
-    # Add a holiday for the same date.
+    # Add a holiday on the *next* occurrence of this slot's weekday so it
+    # falls inside the materialise window but doesn't poison other tests'
+    # tomorrow-dated session lookups.
+    holiday_date = setup.scheduled_date + timedelta(days=7)
     r = await client.post(
         "/academic-calendar",
         headers=setup.admin_headers,
         json={
-            "entry_date": setup.scheduled_date.isoformat(),
+            "entry_date": holiday_date.isoformat(),
             "kind": "holiday",
             "title": "Surprise Holiday",
             "cancels_classes": True,
@@ -304,14 +312,14 @@ async def test_materialiser_skips_holidays(client):
 
     # Re-trigger materialisation by patching the slot.
     await client.patch(
-        f"/timetable/{setup.slot_id}",
+        f"/timetable/{setup.slot_id}?force=true",
         headers=setup.admin_headers,
         json={"end_time": "11:00:00"},
     )
-    # Existing rows aren't deleted (idempotent UPSERT), but no new row would
-    # appear if we re-materialised on a holiday for a later date. Sanity-
-    # check: re-running materialise for a date already-holiday'd doesn't
-    # blow up.
+    # Existing rows aren't deleted (idempotent UPSERT); the materialiser
+    # just skips the holiday-covered Thursday inside the window. Sanity-
+    # check: re-running materialise after declaring a holiday doesn't
+    # blow up, and the original tomorrow session still resolves.
     sid_after = await _fetch_session_id(client, setup)
     assert sid_after == sid_before
 
